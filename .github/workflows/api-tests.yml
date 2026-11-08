@@ -1,0 +1,79 @@
+name: API tests
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', '**.md']
+  pull_request:
+    paths-ignore: ['docs/**', '**.md']
+  schedule:
+    # Nightly full run, weekdays 03:00 UTC.
+    - cron: '0 3 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      grep:
+        description: 'Tag filter, e.g. @smoke or @smoke|@contract (empty = full suite)'
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  checks: write
+
+# A new push to the same branch cancels the run that is still going.
+concurrency:
+  group: api-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CI: 'true'
+      # Pull request: fast gate (@smoke + @contract).
+      # main, nightly, manual: full suite, or the tag given to workflow_dispatch.
+      GREP: ${{ github.event_name == 'pull_request' && '@smoke|@contract' || inputs.grep || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      # No `playwright install`: this is an API-only suite, no browser is needed.
+
+      # Defaults target the local mock (booted by Playwright's webServer).
+      - run: cp .env.example .env
+
+      - run: npm run check
+
+      # To test a real environment, set the repository variable START_MOCK_SERVER=false and
+      # the secrets API_BASE_URL / API_TOKEN. dotenv does not override variables that are
+      # already set, so these step-level values win over .env without being written to disk.
+      - name: Run Playwright tests
+        env:
+          START_MOCK_SERVER: ${{ vars.START_MOCK_SERVER || 'true' }}
+          API_BASE_URL: ${{ secrets.API_BASE_URL || 'http://localhost:3100' }}
+          API_TOKEN: ${{ secrets.API_TOKEN || 'local-dev-token' }}
+        run: npx playwright test ${GREP:+--grep "$GREP"}
+
+      # JUnit results in the Checks tab, no need to download the artefact.
+      - uses: dorny/test-reporter@v1
+        if: ${{ !cancelled() && github.event.pull_request.head.repo.fork != true }}
+        with:
+          name: Playwright results
+          path: reports/junit/results.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-reports-${{ github.event_name }}-${{ github.run_number }}
+          path: |
+            reports/
+            test-results/
+          retention-days: 14
